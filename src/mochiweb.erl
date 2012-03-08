@@ -63,7 +63,10 @@ new_request({Socket, {Method, '*'=Uri, Version}, Headers}) ->
 new_response({Request, Code, Headers}) ->
     mochiweb_response:new(Request,
                           Code,
-                          mochiweb_headers:make(Headers)).
+                          mochiweb_headers:make(Headers));
+new_request({_, {"CONNECT", {scheme, _}, _}, _}) ->
+    ResponseHeaders = mochiweb_headers:make(Headers)
+    mochiweb_request:respond({501, [], []}).
 
 %% @spec ensure_started(App::atom()) -> ok
 %% @doc Start the given App if it has not been started already.
