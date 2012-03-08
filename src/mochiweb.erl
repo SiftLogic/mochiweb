@@ -56,17 +56,16 @@ new_request({Socket, {Method, '*'=Uri, Version}, Headers}) ->
                          Method,
                          Uri,
                          Version,
-                         mochiweb_headers:make(Headers)).
+                         mochiweb_headers:make(Headers));
+new_request({_, {"CONNECT", _, _}, _}) ->
+    mochiweb_request:respond({501, [], []}).
 
 %% @spec new_response({Request, integer(), Headers}) -> MochiWebResponse
 %% @doc Return a mochiweb_response data structure.
 new_response({Request, Code, Headers}) ->
     mochiweb_response:new(Request,
                           Code,
-                          mochiweb_headers:make(Headers));
-new_request({_, {"CONNECT", {scheme, _}, _}, _}) ->
-    ResponseHeaders = mochiweb_headers:make(Headers)
-    mochiweb_request:respond({501, [], []}).
+                          mochiweb_headers:make(Headers)).
 
 %% @spec ensure_started(App::atom()) -> ok
 %% @doc Start the given App if it has not been started already.
