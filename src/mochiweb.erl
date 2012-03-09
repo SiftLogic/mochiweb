@@ -57,8 +57,12 @@ new_request({Socket, {Method, '*'=Uri, Version}, Headers}) ->
                          Uri,
                          Version,
                          mochiweb_headers:make(Headers));
-new_request({_, {"CONNECT", _, _}, _}) ->
-    mochiweb_request:respond({501, [], []}).
+new_request({Socket, {Method, {scheme, _Host, _Port}, Version}, Headers}) ->
+    mochiweb_request:new(Socket,
+                         Method,
+                         "/",
+                         Version,
+                         mochiweb_headers:make(Headers)).
 
 %% @spec new_response({Request, integer(), Headers}) -> MochiWebResponse
 %% @doc Return a mochiweb_response data structure.
