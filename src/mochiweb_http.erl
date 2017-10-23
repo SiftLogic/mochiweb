@@ -1,12 +1,30 @@
 %% @author Bob Ippolito <bob@mochimedia.com>
 %% @copyright 2007 Mochi Media, Inc.
+%%
+%% Permission is hereby granted, free of charge, to any person obtaining a
+%% copy of this software and associated documentation files (the "Software"),
+%% to deal in the Software without restriction, including without limitation
+%% the rights to use, copy, modify, merge, publish, distribute, sublicense,
+%% and/or sell copies of the Software, and to permit persons to whom the
+%% Software is furnished to do so, subject to the following conditions:
+%%
+%% The above copyright notice and this permission notice shall be included in
+%% all copies or substantial portions of the Software.
+%%
+%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+%% THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+%% FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+%% DEALINGS IN THE SOFTWARE.
 
 %% @doc HTTP server.
 
 -module(mochiweb_http).
 -author('bob@mochimedia.com').
 -export([start/1, start_link/1, stop/0, stop/1]).
--export([loop/2]).
+-export([loop/3]).
 -export([after_response/2, reentry/1]).
 -export([parse_range_request/1, range_skip_length/2]).
 
@@ -16,6 +34,12 @@
 -define(MAX_HEADERS, 1000).
 -define(DEFAULTS, [{name, ?MODULE},
                    {port, 8888}]).
+
+-ifdef(gen_tcp_r15b_workaround).
+r15b_workaround() -> true.
+-else.
+r15b_workaround() -> false.
+-endif.
 
 parse_options(Options) ->
     {loop, HttpLoop} = proplists:lookup(loop, Options),
@@ -34,44 +58,50 @@ stop(Name) ->
 %%     Option = {name, atom()} | {ip, string() | tuple()} | {backlog, integer()}
 %%              | {nodelay, boolean()} | {acceptor_pool_size, integer()}
 %%              | {ssl, boolean()} | {profile_fun, undefined | (Props) -> ok}
-%%              | {link, false}
+%%              | {link, false} | {recbuf, undefined | non_negative_integer()}
 %% @doc Start a mochiweb server.
 %%      profile_fun is used to profile accept timing.
 %%      After each accept, if defined, profile_fun is called with a proplist of a subset of the mochiweb_socket_server state and timing information.
 %%      The proplist is as follows: [{name, Name}, {port, Port}, {active_sockets, ActiveSockets}, {timing, Timing}].
 %% @end
 start(Options) ->
+    ok = ensure_started(mochiweb_clock),
     mochiweb_socket_server:start(parse_options(Options)).
 
 start_link(Options) ->
+    ok = ensure_started(mochiweb_clock),
     mochiweb_socket_server:start_link(parse_options(Options)).
 
-loop(Socket, Body) ->
-    ok = mochiweb_socket:setopts(Socket, [{packet, http}]),
-    request(Socket, Body).
+ensure_started(M) ->
+    case M:start() of
+        {ok, _Pid} ->
+            ok;
+        {error, {already_started, _Pid}} ->
+            ok
+    end.
 
-request(Socket, Body) ->
-    ok = mochiweb_socket:setopts(Socket, [{active, once}]),
+loop(Socket, Opts, Body) ->
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, http}])),
+    request(Socket, Opts, Body).
+
+request(Socket, Opts, Body) ->
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{active, once}])),
     receive
         {Protocol, _, {http_request, Method, Path, Version}} when Protocol == http orelse Protocol == ssl ->
-            ok = mochiweb_socket:setopts(Socket, [{packet, httph}]),
-            headers(Socket, {Method, Path, Version}, [], Body, 0);
+            ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, httph}])),
+            headers(Socket, Opts, {Method, Path, Version}, [], Body, 0);
         {Protocol, _, {http_error, "\r\n"}} when Protocol == http orelse Protocol == ssl ->
-            request(Socket, Body);
+            request(Socket, Opts, Body);
         {Protocol, _, {http_error, "\n"}} when Protocol == http orelse Protocol == ssl ->
-            request(Socket, Body);
+            request(Socket, Opts, Body);
         {tcp_closed, _} ->
             mochiweb_socket:close(Socket),
             exit(normal);
+        {tcp_error, _, emsgsize} = Other ->
+            handle_invalid_msg_request(Other, Socket, Opts);
         {ssl_closed, _} ->
             mochiweb_socket:close(Socket),
-            exit(normal);
-        {tcp_error,_,emsgsize} ->
-            % R15B02 returns this then closes the socket, so close and exit
-            mochiweb_socket:close(Socket),
-            exit(normal);
-        _Other ->
-            handle_invalid_request(Socket)
+            exit(normal)
     after ?REQUEST_RECV_TIMEOUT ->
         mochiweb_socket:close(Socket),
         exit(normal)
@@ -82,29 +112,25 @@ reentry(Body) ->
             ?MODULE:after_response(Body, Req)
     end.
 
-headers(Socket, Request, Headers, _Body, ?MAX_HEADERS) ->
+headers(Socket, Opts, Request, Headers, _Body, ?MAX_HEADERS) ->
     %% Too many headers sent, bad request.
-    ok = mochiweb_socket:setopts(Socket, [{packet, raw}]),
-    handle_invalid_request(Socket, Request, Headers);
-headers(Socket, Request, Headers, Body, HeaderCount) ->
-    ok = mochiweb_socket:setopts(Socket, [{active, once}]),
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, raw}])),
+    handle_invalid_request(Socket, Opts, Request, Headers);
+headers(Socket, Opts, Request, Headers, Body, HeaderCount) ->
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{active, once}])),
     receive
         {Protocol, _, http_eoh} when Protocol == http orelse Protocol == ssl ->
-            Req = new_request(Socket, Request, Headers),
+            Req = new_request(Socket, Opts, Request, Headers),
             call_body(Body, Req),
             ?MODULE:after_response(Body, Req);
         {Protocol, _, {http_header, _, Name, _, Value}} when Protocol == http orelse Protocol == ssl ->
-            headers(Socket, Request, [{Name, Value} | Headers], Body,
+            headers(Socket, Opts, Request, [{Name, Value} | Headers], Body,
                     1 + HeaderCount);
         {tcp_closed, _} ->
             mochiweb_socket:close(Socket),
             exit(normal);
-        {tcp_error,_,emsgsize} ->
-            % R15B02 returns this then closes the socket, so close and exit
-            mochiweb_socket:close(Socket),
-            exit(normal);
-        _Other ->
-            handle_invalid_request(Socket, Request, Headers)
+        {tcp_error, _, emsgsize} = Other ->
+            handle_invalid_msg_request(Other, Socket, Opts, Request, Headers)
     after ?HEADERS_RECV_TIMEOUT ->
         mochiweb_socket:close(Socket),
         exit(normal)
@@ -117,21 +143,31 @@ call_body({M, F}, Req) ->
 call_body(Body, Req) ->
     Body(Req).
 
--spec handle_invalid_request(term()) -> no_return().
-handle_invalid_request(Socket) ->
-    handle_invalid_request(Socket, {'GET', {abs_path, "/"}, {0,9}}, []),
-    exit(normal).
+-spec handle_invalid_msg_request(term(), term(), term()) -> no_return().
+handle_invalid_msg_request(Msg, Socket, Opts) ->
+    handle_invalid_msg_request(Msg, Socket, Opts, {'GET', {abs_path, "/"}, {0,9}}, []).
 
--spec handle_invalid_request(term(), term(), term()) -> no_return().
-handle_invalid_request(Socket, Request, RevHeaders) ->
-    Req = new_request(Socket, Request, RevHeaders),
+-spec handle_invalid_msg_request(term(), term(), term(), term(), term()) -> no_return().
+handle_invalid_msg_request(Msg, Socket, Opts, Request, RevHeaders) ->
+    case {Msg, r15b_workaround()} of
+        {{tcp_error,_,emsgsize}, true} ->
+            %% R15B02 returns this then closes the socket, so close and exit
+            mochiweb_socket:close(Socket),
+            exit(normal);
+        _ ->
+            handle_invalid_request(Socket, Opts, Request, RevHeaders)
+    end.
+
+-spec handle_invalid_request(term(), term(), term(), term()) -> no_return().
+handle_invalid_request(Socket, Opts, Request, RevHeaders) ->
+    Req = new_request(Socket, Opts, Request, RevHeaders),
     Req:respond({400, [], []}),
     mochiweb_socket:close(Socket),
     exit(normal).
 
-new_request(Socket, Request, RevHeaders) ->
-    ok = mochiweb_socket:setopts(Socket, [{packet, raw}]),
-    mochiweb:new_request({Socket, Request, lists:reverse(RevHeaders)}).
+new_request(Socket, Opts, Request, RevHeaders) ->
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, raw}])),
+    mochiweb:new_request({Socket, Opts, Request, lists:reverse(RevHeaders)}).
 
 after_response(Body, Req) ->
     Socket = Req:get(socket),
@@ -142,15 +178,14 @@ after_response(Body, Req) ->
         false ->
             Req:cleanup(),
             erlang:garbage_collect(),
-            ?MODULE:loop(Socket, Body)
+            ?MODULE:loop(Socket, mochiweb_request:get(opts, Req), Body)
     end.
 
-parse_range_request("bytes=0-") ->
-    undefined;
 parse_range_request(RawRange) when is_list(RawRange) ->
     try
         "bytes=" ++ RangeString = RawRange,
-        Ranges = string:tokens(RangeString, ","),
+        RangeTokens = [string:strip(R) || R <- string:tokens(RangeString, ",")],
+        Ranges = [R || R <- RangeTokens, string:len(R) > 0],
         lists:map(fun ("-" ++ V)  ->
                           {none, list_to_integer(V)};
                       (R) ->
@@ -177,11 +212,9 @@ range_skip_length(Spec, Size) ->
             {R, Size - R};
         {_OutOfRange, none} ->
             invalid_range;
-        {Start, End} when 0 =< Start, Start =< End, End < Size ->
-            {Start, End - Start + 1};
-        {Start, End} when 0 =< Start, Start =< End, End >= Size ->
-            {Start, Size - Start};
-        {_OutOfRange, _End} ->
+        {Start, End} when Start >= 0, Start < Size, Start =< End ->
+            {Start, erlang:min(End + 1, Size) - Start};
+        {_InvalidStart, _InvalidEnd} ->
             invalid_range
     end.
 
@@ -198,7 +231,7 @@ range_test() ->
     ?assertEqual([{none, 20}], parse_range_request("bytes=-20")),
 
     %% trivial single range
-    ?assertEqual(undefined, parse_range_request("bytes=0-")),
+    ?assertEqual([{0, none}], parse_range_request("bytes=0-")),
 
     %% invalid, single ranges
     ?assertEqual(fail, parse_range_request("")),
@@ -212,6 +245,19 @@ range_test() ->
     ?assertEqual(
        [{20, none}, {50, 100}, {none, 200}],
        parse_range_request("bytes=20-,50-100,-200")),
+
+    %% valid, multiple range with whitespace
+    ?assertEqual(
+       [{20, 30}, {50, 100}, {110, 200}],
+       parse_range_request("bytes=20-30, 50-100 , 110-200")),
+
+    %% valid, multiple range with extra commas
+    ?assertEqual(
+       [{20, 30}, {50, 100}, {110, 200}],
+       parse_range_request("bytes=20-30,,50-100,110-200")),
+    ?assertEqual(
+       [{20, 30}, {50, 100}, {110, 200}],
+       parse_range_request("bytes=20-30, ,50-100,,,110-200")),
 
     %% no ranges
     ?assertEqual([], parse_range_request("bytes=")),
@@ -232,6 +278,7 @@ range_skip_length_test() ->
     ?assertEqual({BodySize, 0}, range_skip_length({none, 0}, BodySize)),
     ?assertEqual({0, BodySize}, range_skip_length({none, BodySize}, BodySize)),
     ?assertEqual({0, BodySize}, range_skip_length({0, none}, BodySize)),
+    ?assertEqual({0, BodySize}, range_skip_length({0, BodySize + 1}, BodySize)),
     BodySizeLess1 = BodySize - 1,
     ?assertEqual({BodySizeLess1, 1},
                  range_skip_length({BodySize - 1, none}, BodySize)),
@@ -259,6 +306,8 @@ range_skip_length_test() ->
                  range_skip_length({-1, none}, BodySize)),
     ?assertEqual(invalid_range,
                  range_skip_length({BodySize, none}, BodySize)),
+    ?assertEqual(invalid_range,
+                 range_skip_length({BodySize + 1, BodySize + 5}, BodySize)),
     ok.
 
 -endif.
