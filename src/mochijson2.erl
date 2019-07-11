@@ -39,7 +39,7 @@
 
 -module(mochijson2).
 -author('bob@mochimedia.com').
--export([encoder/1, encode/1]).
+-export([encoder/1, encode/1, encode_utf8/1]).
 -export([decoder/1, decode/1, decode/2]).
 
 %% This is a macro to placate syntax highlighters..
@@ -94,6 +94,11 @@ encoder(Options) ->
 %% @doc Encode the given as JSON to an iolist.
 encode(Any) ->
     json_encode(Any, #encoder{}).
+
+%% @spec encode_utf8(json_term()) -> iolist()
+%% @doc Encode the given as JSON to an iolist.
+encode_utf8(Any) ->
+  json_encode(Any, #encoder{utf8 = true}).
 
 %% @spec decoder([decoder_option()]) -> function()
 %% @doc Create a decoder/1 with the given options.
